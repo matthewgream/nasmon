@@ -1,0 +1,2 @@
+# per-host configs stay local: they hold passwords
+nasmon.*.cfg

@@ -1,0 +1,18 @@
+[Unit]
+Description=nasmon - check NAS RAID arrays, disk temperatures and volumes, publish to MQTT
+Documentation=file:/opt/nasmon/README.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/nasmon /etc/default/nasmon
+TimeoutStartSec=5min
+# ssh's known_hosts for the NAS
+StateDirectory=nasmon
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal

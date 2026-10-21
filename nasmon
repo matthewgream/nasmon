@@ -1,0 +1,249 @@
+#!/usr/bin/env node
+//
+// nasmon -- check a NAS's RAID arrays, disk temperatures and volume usage over ssh, and publish the
+// result to MQTT as one JSON message, for mqtt-watchdog to alert on.
+//
+// Nothing is installed on the NAS: each run sends one shell command and parses what comes back:
+//
+//     cat /proc/mdstat            the md arrays: members, spares, failures, resync/recovery progress
+//     df -k                       size and usage of each mounted md array
+//     /sbin/get_hd_temp <bay>     disk temperatures (QNAP; skipped when absent)
+//     cat /proc/uptime
+//
+// An array is healthy when it is not inactive, none of its members has failed, and its active members
+// are at least the expected count: array-<md>=<count> in the config, or else the array's own member
+// count. QNAP's system arrays (md9, md13) are built for every bay, so in a part-filled NAS they always
+// look short ([UUU_]): give their expected count. A disk is hot at temp-hot degrees or more, and a
+// volume full at usage-full percent or more. Every such problem is listed in the message; when the NAS
+// cannot be checked at all, the message says so instead (ok: false, with the error).
+//
+// Written for an old QNAP (TS-409 Pro, firmware 3.3): its root filesystem is a ramdisk, so an ssh key
+// added for admin is gone after a reboot, and the password is used instead -- through sshpass, from
+// the environment, so it never shows in the process list. With no password, root's ssh key is used.
+// Its OpenSSH 4.6 only offers ssh-rsa host keys, which current clients refuse unless asked.
+//
+// Config: /etc/default/nasmon (key=value).   Usage: nasmon [config] [--dry-run]   (--dry-run: print, don't publish)
+
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
+
+// ------------------------------------------------------------------------------------------ config
+
+const args = process.argv.slice(2);
+const DRY_RUN = args.includes('--dry-run');
+const CFG_FILE = args.find((a) => !a.startsWith('--')) || '/etc/default/nasmon';
+const cfg = {};
+try {
+    for (const line of fs.readFileSync(CFG_FILE, 'utf8').split('\n')) {
+        const m = /^\s*([a-z][a-z0-9-]*)\s*=\s*(.*?)\s*$/.exec(line);
+        if (m) cfg[m[1]] = m[2];
+    }
+} catch (e) {
+    console.error(`nasmon: ${CFG_FILE}: ${e.message}`);
+    process.exit(1);
+}
+const num = (k, d) => (cfg[k] !== undefined && cfg[k] !== '' && !isNaN(Number(cfg[k])) ? Number(cfg[k]) : d);
+
+const NAME = cfg['name'] || 'nas';
+const HOST = cfg['host'] || '';
+const USERNAME = cfg['username'] || 'admin';
+const PASSWORD = cfg['password'] || '';
+const BAYS = num('bays', 4);
+const TEMP_HOT = num('temp-hot', 50);
+const USAGE_FULL = num('usage-full', 90);
+const MQTT_SERVER = cfg['mqtt-server'] || 'mqtt://localhost';
+const MQTT_TOPIC = cfg['mqtt-topic'] || `system/storage/${NAME}`;
+const KNOWN_HOSTS = cfg['known-hosts'] || '/var/lib/nasmon/known_hosts';
+const EXPECTED = Object.fromEntries(Object.entries(cfg)          // array-<md>=<count>
+    .filter(([k, v]) => k.startsWith('array-') && v !== '' && !isNaN(Number(v)))
+    .map(([k, v]) => [k.slice('array-'.length), Number(v)]));
+
+if (!HOST) {
+    console.error(`nasmon: ${CFG_FILE}: no host`);
+    process.exit(1);
+}
+
+// ------------------------------------------------------------------------------------------ log
+
+const log = (...a) => console.log(...a);            // journald stamps it
+const pad = (n) => String(n).padStart(2, '0');
+const localtime = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+const gb = (bytes) => Math.round(bytes / 1e8) / 10;
+
+// ------------------------------------------------------------------------------------------ process
+
+function run(cmd, argv, input, timeoutMs, env) {
+    return new Promise((resolve, reject) => {
+        const child = spawn(cmd, argv, { timeout: timeoutMs, env: env ? { ...process.env, ...env } : process.env });
+        let out = '', err = '';
+        child.stdout.setEncoding('utf8').on('data', (d) => (out += d));
+        child.stderr.setEncoding('utf8').on('data', (d) => (err += d));
+        child.on('error', reject);
+        child.stdin.on('error', () => {});              // EPIPE when it exits unread (ssh failing fast); its exit code tells
+        child.on('close', (code, signal) =>
+            code === 0 ? resolve(out) : reject(new Error(err.trim().split('\n').pop() || `${cmd} exited ${code ?? signal}`)));
+        child.stdin.end(input || '');
+    });
+}
+
+// ------------------------------------------------------------------------------------------ nas
+
+// one command for whatever shell the NAS has (busybox ash on QNAP), its sections marked '## <name>'
+const REMOTE = [
+    'echo "## mdstat"; cat /proc/mdstat',
+    'echo "## df"; df -k',
+    'echo "## temp"; if [ -x /sbin/get_hd_temp ]; then ' +
+        `for b in ${Array.from({ length: BAYS }, (_, i) => i + 1).join(' ')}; do echo "hd$b $(/sbin/get_hd_temp $b 2>/dev/null)"; done; fi`,
+    'echo "## uptime"; cat /proc/uptime',
+].join('; ');
+
+const SSH = ['-F', '/dev/null', '-o', 'ConnectTimeout=20', '-o', 'ServerAliveInterval=10', '-o', 'ServerAliveCountMax=3',
+    '-o', `UserKnownHostsFile=${KNOWN_HOSTS}`, '-o', 'StrictHostKeyChecking=accept-new', '-o', 'LogLevel=ERROR',
+    // '+' adds the old ssh-rsa back without dropping anything a newer NAS would offer
+    '-o', 'HostKeyAlgorithms=+ssh-rsa', '-o', 'PubkeyAcceptedAlgorithms=+ssh-rsa'];
+const SSHPASS_ERRORS = { 5: 'login refused (wrong password?)', 6: 'host key not accepted' };
+
+async function remote(command) {
+    if (!PASSWORD)
+        return run('ssh', [...SSH, '-o', 'BatchMode=yes', `${USERNAME}@${HOST}`, command], '', 60000);
+    try {
+        return await run('sshpass', ['-e', 'ssh', ...SSH, '-o', 'PubkeyAuthentication=no', '-o', 'NumberOfPasswordPrompts=1',
+            `${USERNAME}@${HOST}`, command], '', 60000, { SSHPASS: PASSWORD });
+    } catch (e) {
+        const code = /^sshpass exited (\d+)$/.exec(e.message);
+        throw code && SSHPASS_ERRORS[code[1]] ? new Error(SSHPASS_ERRORS[code[1]]) : e;
+    }
+}
+
+function sections(text) {
+    const out = {};
+    let current = null;
+    for (const line of text.split('\n')) {
+        const m = /^## (\w+)$/.exec(line);
+        if (m) out[(current = m[1])] = [];
+        else if (current) out[current].push(line);
+    }
+    return out;
+}
+
+//  md4 : active raid1 sdc2[2](S) sdb2[1] sda2[0]
+//        530048 blocks [2/2] [UU]
+//        [=>...................]  recovery =  8.5% (45056/530048) finish=2.1min speed=3755K/sec
+function parseMdstat(lines) {
+    const arrays = [];
+    let array = null, m;
+    for (const line of lines) {
+        if ((m = /^(md\w*)\s*:\s*(.*)$/.exec(line))) {
+            const tokens = m[2].split(/\s+/).filter(Boolean);
+            array = { name: m[1], state: tokens.shift(), level: '', members: [], spares: [], faulty: [] };
+            for (const token of tokens) {
+                const member = /^([\w-]+)\[\d+\]((?:\([A-Z]\))*)$/.exec(token);
+                if (member) (member[2].includes('(F)') ? array.faulty : member[2].includes('(S)') ? array.spares : array.members).push(member[1]);
+                else if (!token.startsWith('(') && !array.level) array.level = token;   // not (read-only) / (auto-read-only)
+            }
+            arrays.push(array);
+        } else if (!array) {
+            continue;
+        } else if ((m = /\[(\d+)\/(\d+)\]\s+\[([U_]+)\]/.exec(line))) {
+            array.devices = Number(m[1]);
+            array.active = Number(m[2]);
+            array.status = `[${m[3]}]`;
+        } else if ((m = /\b(resync|recovery|reshape|check|repair)\s*=\s*([\d.]+)%(?:.*?finish=(\S+))?/.exec(line))) {
+            array.sync = `${m[1]} ${m[2]}%${m[3] ? `, finish ${m[3]}` : ''}`;
+        } else if ((m = /\b(resync|recovery|reshape|check|repair)\s*=\s*(DELAYED|PENDING)/.exec(line))) {
+            array.sync = `${m[1]} ${m[2].toLowerCase()}`;
+        } else if (!line.trim()) {
+            array = null;
+        }
+    }
+    return arrays;
+}
+
+// first mount of each md device wins (QNAP mounts some twice, inside its rootfs too)
+function parseDf(lines) {
+    const usage = {};
+    for (const line of lines) {
+        const m = /^\/dev\/(md\w*)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)%\s+(\S+)/.exec(line);
+        if (m && !usage[m[1]]) usage[m[1]] = { size: Number(m[2]) * 1024, free: Number(m[4]) * 1024, used: Number(m[5]), mount: m[6] };
+    }
+    return usage;
+}
+
+function parseTemps(lines) {
+    const disks = [];
+    for (const line of lines) {
+        const m = /^hd(\d+)\s+(\d+)\s*$/.exec(line);            // an empty bay reads 'none'
+        if (m) disks.push({ id: `${NAME}/hd${m[1]}`, name: `hd${m[1]}`, bay: Number(m[1]), temp: Number(m[2]), hot: Number(m[2]) >= TEMP_HOT });
+    }
+    return disks;
+}
+
+function check(out) {
+    const usage = parseDf(out.df || []), problems = [];
+    const arrays = parseMdstat(out.mdstat || []).map((a) => {
+        const active = a.active ?? a.members.length;            // raid0/linear have no [n/m]
+        const expected = EXPECTED[a.name] ?? a.devices ?? active;
+        const array = {
+            id: `${NAME}/${a.name}`, name: a.name, level: a.level, state: a.state, status: a.status ?? '',
+            devices: a.devices ?? active, active, expected, failed: a.faulty.length, spare: a.spares.length,
+            members: a.members.join(' '), ...(a.spares.length && { spares: a.spares.join(' ') }), ...(a.faulty.length && { faulty: a.faulty.join(' ') }),
+            ...(a.sync && { sync: a.sync }),
+            healthy: a.state !== 'inactive' && a.faulty.length === 0 && active >= expected,
+        };
+        if (a.state === 'inactive')
+            problems.push(`${a.name} inactive`);
+        else if (!array.healthy)
+            problems.push(`${a.name} degraded ${array.status} ${active}/${expected}${a.faulty.length ? `, failed ${array.faulty}` : ''}${a.sync ? `, ${a.sync}` : ''}`);
+        const u = usage[a.name];
+        if (u) {
+            Object.assign(array, { mount: u.mount, size_gb: gb(u.size), free_gb: gb(u.free), used: u.used, full: u.used >= USAGE_FULL });
+            if (array.full) problems.push(`${a.name} ${u.used}% full`);
+        }
+        return array;
+    });
+    if (!arrays.length) throw new Error('no md arrays in /proc/mdstat');
+    const disks = parseTemps(out.temp || []);
+    for (const d of disks) if (d.hot) problems.push(`${d.name} hot ${d.temp}°C`);
+    const uptime = Math.floor(Number(((out.uptime || [])[0] || '').split(/\s+/)[0])) || undefined;
+
+    log(`${NAME}: ${arrays.map((a) => `${a.name} ${a.level} ${a.status} ${a.active}/${a.expected}${a.used !== undefined ? ` ${a.used}%` : ''}${a.sync ? ` (${a.sync})` : ''}`).join(', ')}` +
+        `${disks.length ? `; ${disks.map((d) => `${d.name} ${d.temp}°C`).join(' ')}` : ''}; ${problems.length ? `PROBLEMS: ${problems.join('; ')}` : 'healthy'}`);
+    return { name: NAME, host: HOST, time: localtime(new Date()), ok: true, healthy: problems.length === 0, problems, uptime, arrays, disks };
+}
+
+// ------------------------------------------------------------------------------------------ mqtt
+
+function publish(message) {
+    const url = new URL(MQTT_SERVER.includes('://') ? MQTT_SERVER : `mqtt://${MQTT_SERVER}`);
+    const tls = url.protocol === 'mqtts:';
+    // retained: anyone subscribing between runs (hours apart) gets the latest state at once
+    return run('mosquitto_pub', ['-h', url.hostname, '-p', url.port || (tls ? '8883' : '1883'), ...(tls ? ['--capath', '/etc/ssl/certs'] : []),
+        '-t', MQTT_TOPIC, '-q', '1', '-r', '-s'], JSON.stringify(message), 30000);
+}
+
+// ------------------------------------------------------------------------------------------ main
+
+(async () => {
+    let report, failed = false;
+    try {
+        fs.mkdirSync(path.dirname(KNOWN_HOSTS), { recursive: true });
+        report = check(sections(await remote(REMOTE)));
+    } catch (e) {
+        failed = true;
+        console.error(`${NAME}: check failed: ${e.message}`);
+        report = { name: NAME, host: HOST, time: localtime(new Date()), ok: false, error: e.message };
+    }
+    if (DRY_RUN) {
+        console.log(JSON.stringify(report, null, 2));
+    } else {
+        try {
+            await publish(report);
+        } catch (e) {
+            console.error(`${NAME}: publish to ${MQTT_SERVER} ${MQTT_TOPIC} failed: ${e.message}`);
+            failed = true;
+        }
+    }
+    process.exit(failed ? 1 : 0);
+})();
